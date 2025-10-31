@@ -14,8 +14,8 @@ const uint8_t openSpeed  = 250;
 const uint8_t closeSpeed = 250;
 
 // === Hard-coded run times (ms) ===
-const unsigned long openTimeMs    = 1500;
-const unsigned long closeTimeMs   = 1500;
+const unsigned long openTimeMs    = 1300;
+const unsigned long closeTimeMs   = 1300;
 const unsigned long wiggleTimeMs  = 100;
 
 // === H-bridge dead time ===
