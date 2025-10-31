@@ -1,230 +1,100 @@
-// ================== RS-485 Flower Node (ACK-only, no debug) ==================
-const int myID = 17;
+#include <Arduino.h>
 
-// ---------- Pins ----------
-const int motorOpenPin  = 9;
-const int motorClosePin = 10;
+// ================== RS-485 Flower Node (Serial-only, blocking moves) ==================
+const uint8_t myID = 4;
 
-const int hallOpenPin   = 12;
-const int hallClosePin  = 11;
+// === Pin Definitions ===
+const uint8_t motorOpenPin  = 10;  // PWM for OPEN direction
+const uint8_t motorClosePin = 9;   // PWM for CLOSE direction
+const uint8_t ledStripPin   = 3;   // LED strip (PWM)
+const uint8_t rs485DirPin   = 2;   // MAX485 DE/RE tied together
 
-const int buttonPin     = 13;
+// === Motor Speeds (0..255) ===
+const uint8_t openSpeed  = 250;
+const uint8_t closeSpeed = 250;
 
-const int petalLedPin   = 3;
-const int centralLedPin = 8;
+// === Hard-coded run times (ms) ===
+const unsigned long openTimeMs    = 1500;
+const unsigned long closeTimeMs   = 1500;
+const unsigned long wiggleTimeMs  = 100;
 
-const int rs485DirPin   = 2;   // DE/RE (tie RE to DE on the MAX485)
+// === H-bridge dead time ===
+const unsigned long deadTimeMs    = 10;
 
-// ---------- Motor / LED ----------
-const int motorOpenSpeed  = 130;
-const int motorCloseSpeed = 250;
-const unsigned long wiggleTimeMs = 100;
-
+// === LED Brightness Levels ===
 const int ledMinBrightness = 0;
 const int ledMaxBrightness = 120;
 
-const unsigned long ledRampDefaultMs = 1500;
+// === LED Ramping ===
+const unsigned long ledRampDuration   = 7500; // total ramp duration (ms)
+const int           ledStep           = 2;    // change per step
+const unsigned long ledRampStepDelay  = 20;   // ms between LED steps
 
-// ---------- Debounce / Safety ----------
-const unsigned long debounceDelay = 250;
-const unsigned long motorSafetyTimeoutMs = 10000;
+// Derived
+const int ledBrightnessRange = ledMaxBrightness - ledMinBrightness;
 
-unsigned long motorStartTime = 0;
-
-// ---------- State ----------
-enum SystemState { WAITING, OPENING, CLOSING };
-SystemState currentState = WAITING;
-
-bool lastButtonState = LOW;
-unsigned long lastButtonTime = 0;
-
+// State
+bool isOpen = false;                         // tracked by timers (no sensors)
 int  currentLedBrightness = ledMinBrightness;
-bool motorStarted = false;
 
-// LED ramp
-bool           ledRamping = false;
-int            ledRampStartBrightness = 0;
-int            ledTargetBrightness = ledMinBrightness;
-unsigned long  ledRampStartTime = 0;
-unsigned long  ledRampDurationMs = 0;
+// Busy flag to ignore new commands during a move/ramp
+enum SystemState { IDLE, BUSY };
+SystemState sys = IDLE;
 
-// ======== RS-485 (Serial on Nano pins 0/1) ========
+// --- Forward declarations ---
+void runMotorForward(unsigned long motorMs);              // NEW: motor-only
+void runMotorBackward(unsigned long motorMs);             // NEW: motor-only
+void runMotorForwardWithLed(unsigned long motorMs);
+void runMotorBackwardWithLed(unsigned long motorMs);
+void stopMotor();
+void setLedRaw(int value);
+void rampLedTo(int targetBrightness, unsigned long rampMs);
+void initSequence();
+void blinkSequence();
+
+// ======== RS-485 (Serial on pins 0/1) ========
 #define RS485 Serial
 
 void rs485Begin() {
   pinMode(rs485DirPin, OUTPUT);
-  digitalWrite(rs485DirPin, LOW);   // idle = receive (DE/RE low)
+  digitalWrite(rs485DirPin, LOW); // RX (DE/RE low)
   RS485.begin(115200);
-  delay(100);                       // allow transceiver to settle
+  delay(50);
 }
 
-// Enable driver, send a line, return to RX
 void rs485SendLine(const String& s) {
-  digitalWrite(rs485DirPin, HIGH);  // enable driver
+  digitalWrite(rs485DirPin, HIGH);  // TX enable
   delayMicroseconds(8);
   RS485.print(s);
   RS485.print('\n');
-  RS485.flush();                    // wait until TX shift reg empty
-  digitalWrite(rs485DirPin, LOW);   // back to receive
+  RS485.flush();
+  digitalWrite(rs485DirPin, LOW);   // back to RX
 }
 
-// ACK helper (the ONLY thing we transmit on the bus)
+// ACK helper (only for directed messages)
 void ack(const String& payload, bool isBroadcast) {
-  // 0/... -> broadcast (executed by all, NO ACK)
-  // N/... -> direct to node N (with ACK)
-  if (!isBroadcast) {
-    rs485SendLine(String(myID) + "/ACK:" + payload);
-  }
+  if (!isBroadcast) rs485SendLine(String(myID) + "/ACK:" + payload);
 }
 
 // ======== Setup / Loop ========
 void setup() {
-  pinMode(motorOpenPin, OUTPUT);
+  pinMode(motorOpenPin,  OUTPUT);
   pinMode(motorClosePin, OUTPUT);
-
-  pinMode(hallOpenPin, INPUT_PULLUP);
-  pinMode(hallClosePin, INPUT_PULLUP);
-  pinMode(buttonPin, INPUT_PULLUP);
-
-  pinMode(petalLedPin, OUTPUT);
-  pinMode(centralLedPin, OUTPUT);
+  pinMode(ledStripPin,   OUTPUT);
 
   stopMotor();
-  analogWrite(petalLedPin, ledMinBrightness);
-  digitalWrite(centralLedPin, LOW);
+  setLedRaw(ledMinBrightness);
 
   rs485Begin();
-  startupSequence();   // quiet mechanical init
 }
 
 void loop() {
-  unsigned long now = millis();
-
   handleSerialCommand();
-
-  // Local button
-  bool buttonPressed = (digitalRead(buttonPin) == LOW);
-  if (buttonPressed && lastButtonState == HIGH && (now - lastButtonTime > debounceDelay)) {
-    lastButtonTime = now;
-
-    if (currentState == WAITING) {
-      if (digitalRead(hallClosePin) == LOW) {
-        currentState = OPENING;
-        motorStarted = false;
-      } else if (digitalRead(hallOpenPin) == LOW) {
-        currentState = CLOSING;
-        motorStarted = false;
-      }
-    } else {
-      stopMotor();
-      currentState = WAITING;
-    }
-  }
-  lastButtonState = buttonPressed ? LOW : HIGH;
-
-  handleMotorState();
-  updateLedRamp();
 }
 
-// ======== Motor control ========
-void handleMotorState() {
-  if (currentState == OPENING) {
-    if (!motorStarted) {
-      analogWrite(motorClosePin, 0);
-      analogWrite(motorOpenPin, motorOpenSpeed);
-      motorStarted = true;
-      motorStartTime = millis();
-    }
-
-    if (motorStarted && (millis() - motorStartTime >= motorSafetyTimeoutMs)) {
-      stopMotor();
-      currentState = WAITING;
-      return;
-    }
-
-    if (digitalRead(hallOpenPin) == LOW) {
-      stopMotor();
-      currentState = WAITING;
-      return;
-    }
-  }
-  else if (currentState == CLOSING) {
-    if (!motorStarted) {
-      analogWrite(motorOpenPin, 0);
-      analogWrite(motorClosePin, motorCloseSpeed);
-      motorStarted = true;
-      motorStartTime = millis();
-    }
-
-    if (motorStarted && (millis() - motorStartTime >= motorSafetyTimeoutMs)) {
-      stopMotor();
-      currentState = WAITING;
-      return;
-    }
-
-    if (digitalRead(hallClosePin) == LOW) {
-      stopMotor();
-      currentState = WAITING;
-      return;
-    }
-  }
-}
-
-void stopMotor() {
-  analogWrite(motorOpenPin, 0);
-  analogWrite(motorClosePin, 0);
-  motorStarted = false;
-}
-
-// ======== LED ramp ========
-void startLedRamp(int target, unsigned long durationMs) {
-  target = constrain(target, ledMinBrightness, ledMaxBrightness);
-  ledRampStartBrightness = currentLedBrightness;
-  ledTargetBrightness    = target;
-  ledRampDurationMs      = durationMs;
-  ledRampStartTime       = millis();
-  ledRamping             = true;
-}
-
-void updateLedRamp() {
-  if (!ledRamping) return;
-
-  unsigned long elapsed = millis() - ledRampStartTime;
-  if (elapsed >= ledRampDurationMs) {
-    currentLedBrightness = ledTargetBrightness;
-    analogWrite(petalLedPin, currentLedBrightness);
-    digitalWrite(centralLedPin, currentLedBrightness > 0 ? HIGH : LOW);
-    ledRamping = false;
-    return;
-  }
-
-  float progress = (float)elapsed / (float)ledRampDurationMs;
-  int newBrightness =
-      ledRampStartBrightness +
-      (int)((ledTargetBrightness - ledRampStartBrightness) * progress);
-
-  currentLedBrightness = newBrightness;
-  analogWrite(petalLedPin, currentLedBrightness);
-  digitalWrite(centralLedPin, currentLedBrightness > 0 ? HIGH : LOW);
-}
-
-// ======== Command handler (RS-485) ========
-void handleSerialCommand() {
-  static String in;
-  while (RS485.available()) {
-    char c = (char)RS485.read();
-    if (c == '\n' || c == '\r') {
-      if (in.length() > 0) processLine(in);
-      in = "";
-    } else if (in.length() < 120) {
-      in += c;
-    }
-  }
-}
-
+// ======== Serial Command Handler ========
 void processLine(String msg) {
   msg.trim();
-
   int slash = msg.indexOf('/');
   if (slash < 0) return;
 
@@ -234,101 +104,253 @@ void processLine(String msg) {
 
   String rest = msg.substring(slash + 1);
   int colon = rest.indexOf(':');
-  String command = (colon < 0) ? rest : rest.substring(0, colon);
-  String value   = (colon < 0) ? ""   : rest.substring(colon + 1);
+  String cmd = (colon < 0) ? rest : rest.substring(0, colon);
+  String val = (colon < 0) ? ""   : rest.substring(colon + 1);
 
-  if (command == "OPEN") {
-    currentState = OPENING;
-    motorStarted = false;
-    ack("OPEN", isBroadcast);
-  }
-  else if (command == "CLOSE") {
-    currentState = CLOSING;
-    motorStarted = false;
-    ack("CLOSE", isBroadcast);
-  }
-  else if (command == "LED") {
-    int val = value.toInt();
-    currentLedBrightness = constrain(val, ledMinBrightness, ledMaxBrightness);
-    analogWrite(petalLedPin, currentLedBrightness);
-    digitalWrite(centralLedPin, currentLedBrightness > 0 ? HIGH : LOW);
-    ack("LED:" + String(currentLedBrightness), isBroadcast);
-  }
-  else if (command == "LEDRAMP") {
-    int comma = value.indexOf(',');
-    if (comma >= 0) {
-      int target = value.substring(0, comma).toInt();
-      unsigned long duration = value.substring(comma + 1).toInt();
-      startLedRamp(target, duration);
-      ack("LEDRAMP:" + String(target) + "," + String(duration), isBroadcast);
+  // Ignore new commands while busy (simple + robust)
+  if (sys == BUSY) return;
+
+  if (cmd == "OPEN") {
+    if (!isOpen) {
+      ack("OPEN", isBroadcast);
+      runMotorForward(openTimeMs);     // motor-only
+      isOpen = true;
     } else {
-      int target = value.toInt();
-      startLedRamp(target, ledRampDefaultMs);
-      ack("LEDRAMP:" + String(target) + "," + String(ledRampDefaultMs), isBroadcast);
+      ack("NOOP:ALREADY_OPEN", isBroadcast);
     }
   }
-  else if (command == "OPENLEDRAMP") {
-    int comma = value.indexOf(',');
+  else if (cmd == "CLOSE") {
+    if (isOpen) {
+      ack("CLOSE", isBroadcast);
+      runMotorBackward(closeTimeMs);   // motor-only
+      isOpen = false;
+    } else {
+      ack("NOOP:ALREADY_CLOSED", isBroadcast);
+    }
+  }
+  else if (cmd == "LED") {
+    int v = constrain(val.toInt(), ledMinBrightness, ledMaxBrightness);
+    setLedRaw(v);
+    ack("LED:" + String(v), isBroadcast);
+  }
+  else if (cmd == "LEDRAMP") {
+    int comma = val.indexOf(',');
+    int target = ledMaxBrightness;
+    unsigned long dur = 1500; // default
     if (comma >= 0) {
-      int target = value.substring(0, comma).toInt();
-      unsigned long duration = value.substring(comma + 1).toInt();
-      currentState = OPENING;
-      motorStarted = false;
-      startLedRamp(target, duration);
-      ack("OPENLEDRAMP:" + String(target) + "," + String(duration), isBroadcast);
+      target = val.substring(0, comma).toInt();
+      dur    = val.substring(comma + 1).toInt();
+    } else if (val.length()) {
+      target = val.toInt();
     }
+    target = constrain(target, ledMinBrightness, ledMaxBrightness);
+    ack("LEDRAMP:" + String(target) + "," + String(dur), isBroadcast);
+    sys = BUSY; rampLedTo(target, dur); sys = IDLE;
   }
-  else if (command == "CLOSELEDRAMP") {
-    int comma = value.indexOf(',');
+  else if (cmd == "OPENLEDRAMP") {
+    int comma = val.indexOf(',');
     if (comma >= 0) {
-      int target = value.substring(0, comma).toInt();
-      unsigned long duration = value.substring(comma + 1).toInt();
-      currentState = CLOSING;
-      motorStarted = false;
-      startLedRamp(target, duration);
-      ack("CLOSELEDRAMP:" + String(target) + "," + String(duration), isBroadcast);
+      int target = constrain(val.substring(0, comma).toInt(), ledMinBrightness, ledMaxBrightness);
+      unsigned long dur = val.substring(comma + 1).toInt();
+      if (!isOpen) {
+        ack("OPENLEDRAMP:" + String(target) + "," + String(dur), isBroadcast);
+        sys = BUSY;
+        // run motor and ramp in parallel-ish (LED ramp limited by motor time)
+        unsigned long rampMs = min(openTimeMs, dur);
+        analogWrite(motorClosePin, 0);
+        delay(deadTimeMs);
+        analogWrite(motorOpenPin, openSpeed);
+        rampLedTo(target, rampMs);
+        if (openTimeMs > rampMs) delay(openTimeMs - rampMs);
+        stopMotor();
+        isOpen = true;
+        sys = IDLE;
+      } else {
+        ack("NOOP:ALREADY_OPEN", isBroadcast);
+      }
     }
   }
-  else if (command == "INIT") {
-    startupSequence();
-    ack("INIT", isBroadcast);
+  else if (cmd == "CLOSELEDRAMP") {
+    int comma = val.indexOf(',');
+    if (comma >= 0) {
+      int target = constrain(val.substring(0, comma).toInt(), ledMinBrightness, ledMaxBrightness);
+      unsigned long dur = val.substring(comma + 1).toInt();
+      if (isOpen) {
+        ack("CLOSELEDRAMP:" + String(target) + "," + String(dur), isBroadcast);
+        sys = BUSY;
+        unsigned long rampMs = min(closeTimeMs, dur);
+        analogWrite(motorOpenPin, 0);
+        delay(deadTimeMs);
+        analogWrite(motorClosePin, closeSpeed);
+        rampLedTo(target, rampMs);
+        if (closeTimeMs > rampMs) delay(closeTimeMs - rampMs);
+        stopMotor();
+        isOpen = false;
+        sys = IDLE;
+      } else {
+        ack("NOOP:ALREADY_CLOSED", isBroadcast);
+      }
+    }
+  }
+  else if (cmd == "INIT") {
+    initSequence();
+  }
+  else if (cmd == "STATE?") {
+    rs485SendLine(String(myID) + "/STATE:ISOPEN=" + String(isOpen ? 1 : 0) +
+                  ",BUSY=" + String(sys == BUSY ? 1 : 0) +
+                  ",LED=" + String(currentLedBrightness));
   }
 }
 
-// ======== Quiet startup helpers (no RS-485 prints) ========
-void startupSequence() {
-  wiggleMotor();
-  blinkLights(3);
-
-  if (digitalRead(hallClosePin) == HIGH) {
-    analogWrite(motorOpenPin, 0);
-    analogWrite(motorClosePin, motorCloseSpeed);
-    unsigned long start = millis();
-    while (digitalRead(hallClosePin) == HIGH && (millis() - start) < motorSafetyTimeoutMs) {
-      delay(10);
+void handleSerialCommand() {
+  static String in;
+  while (RS485.available()) {
+    char c = (char)RS485.read();
+    if (c == '\n' || c == '\r') {
+      if (in.length() > ledMinBrightness) processLine(in);
+      in = "";
+    } else if (in.length() < ledMaxBrightness) {
+      in += c;
     }
-    stopMotor();
   }
-
-  analogWrite(petalLedPin, ledMinBrightness);
-  digitalWrite(centralLedPin, LOW);
 }
 
-void wiggleMotor() {
+// === Motor-only helpers (no LED changes) ===
+void runMotorForward(unsigned long motorMs) {
+  sys = BUSY;
   analogWrite(motorClosePin, 0);
-  analogWrite(motorOpenPin, motorOpenSpeed);
-  delay(wiggleTimeMs);
-  stopMotor(); delay(200);
-
-  analogWrite(motorOpenPin, 0);
-  analogWrite(motorClosePin, motorCloseSpeed);
-  delay(wiggleTimeMs);
-  stopMotor(); delay(600);
+  delay(deadTimeMs);
+  analogWrite(motorOpenPin, openSpeed);
+  delay(motorMs);
+  stopMotor();
+  isOpen = true;
+  sys = IDLE;
 }
 
-void blinkLights(int n) {
-  for (int i = 0; i < n; i++) {
-    analogWrite(petalLedPin, ledMaxBrightness); delay(150);
-    analogWrite(petalLedPin, 0);               delay(150);
+void runMotorBackward(unsigned long motorMs) {
+  sys = BUSY;
+  analogWrite(motorOpenPin, 0);
+  delay(deadTimeMs);
+  analogWrite(motorClosePin, closeSpeed);
+  delay(motorMs);
+  stopMotor();
+  isOpen = false;
+  sys = IDLE;
+}
+
+// === Motor + LED helpers (kept for *LEDRAMP* combos) ===
+void runMotorForwardWithLed(unsigned long motorMs) {
+  sys = BUSY;
+  analogWrite(motorClosePin, 0);
+  delay(deadTimeMs);
+  analogWrite(motorOpenPin, openSpeed);
+
+  const unsigned long rampMs = min(motorMs, ledRampDuration);
+  rampLedTo(ledMaxBrightness, rampMs);
+  if (motorMs > rampMs) delay(motorMs - rampMs);
+
+  stopMotor();
+  isOpen = true;
+  sys = IDLE;
+}
+
+void runMotorBackwardWithLed(unsigned long motorMs) {
+  sys = BUSY;
+  analogWrite(motorOpenPin, 0);
+  delay(deadTimeMs);
+  analogWrite(motorClosePin, closeSpeed);
+
+  const unsigned long rampMs = min(motorMs, ledRampDuration);
+  rampLedTo(ledMinBrightness, rampMs);
+  if (motorMs > rampMs) delay(motorMs - rampMs);
+
+  stopMotor();
+  isOpen = false;
+  sys = IDLE;
+}
+
+void stopMotor() {
+  analogWrite(motorOpenPin,  0);
+  analogWrite(motorClosePin, 0);
+}
+
+// === LED control ===
+void setLedRaw(int value) {
+  if (value < ledMinBrightness) value = ledMinBrightness;
+  if (value > ledMaxBrightness) value = ledMaxBrightness;
+  currentLedBrightness = value;
+  analogWrite(ledStripPin, currentLedBrightness);
+}
+
+// Smoothly ramp from currentLedBrightness to targetBrightness over rampMs.
+void rampLedTo(int targetBrightness, unsigned long rampMs) {
+  if (targetBrightness < ledMinBrightness) targetBrightness = ledMinBrightness;
+  if (targetBrightness > ledMaxBrightness) targetBrightness = ledMaxBrightness;
+
+  if (targetBrightness == currentLedBrightness || rampMs == 0) {
+    setLedRaw(targetBrightness);
+    return;
+  }
+
+  const int direction = (targetBrightness > currentLedBrightness) ? 1 : -1;
+
+  unsigned long stepsByTime  = max(1UL, rampMs / ledRampStepDelay);
+  int delta = abs(targetBrightness - currentLedBrightness);
+  unsigned long stepsByDelta = max(1, delta / max(1, ledStep));
+  unsigned long steps        = max(stepsByTime, stepsByDelta);
+
+  unsigned long perStepDelay = (steps > 0) ? max(1UL, rampMs / steps) : ledRampStepDelay;
+  float exactStep = (float)delta / (float)steps;
+  float accumulator = 0.0f;
+
+  for (unsigned long i = 0; i < steps; ++i) {
+    accumulator += exactStep;
+    int inc = (int)round(accumulator);
+    if (inc != 0) {
+      accumulator -= inc;
+      int next = currentLedBrightness + direction * inc;
+      if ((direction > 0 && next > targetBrightness) ||
+          (direction < 0 && next < targetBrightness)) {
+        next = targetBrightness;
+      }
+      setLedRaw(next);
+    }
+    delay(perStepDelay);
+  }
+
+  setLedRaw(targetBrightness);
+}
+
+void initSequence() {
+    blinkSequence();
+
+    analogWrite(motorClosePin, 0);
+    analogWrite(motorOpenPin, openSpeed);
+    delay(wiggleTimeMs);
+    stopMotor(); delay(200);
+    analogWrite(motorOpenPin, 0);
+    analogWrite(motorClosePin, closeSpeed);
+    delay(wiggleTimeMs);
+    stopMotor(); delay(300);
+
+    // force known closed state (timed close)
+    analogWrite(motorOpenPin, 0);
+    delay(deadTimeMs);
+    analogWrite(motorClosePin, closeSpeed);
+    delay(closeTimeMs);
+    stopMotor();
+    isOpen = false;
+}
+
+// --- Small blink sequence (blocking) ---
+// Blinks 'times' at 'peak' brightness, with on/off durations in ms.
+void blinkSequence()
+{
+  for (uint8_t i = 0; i < 3; ++i) {
+    setLedRaw(120);
+    delay(300);
+    setLedRaw(0);
+    delay(300);
   }
 }
+
