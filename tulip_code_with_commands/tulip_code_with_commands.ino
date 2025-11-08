@@ -1,10 +1,11 @@
 #include <Arduino.h>
 
 // ================== RS-485 Flower Node (Serial-only, blocking moves) ==================
-const uint8_t myID = 4;
+const uint8_t myID = 26;
 
 // === Pin Definitions ===
 const uint8_t motorOpenPin  = 10;  // PWM for OPEN direction
+
 const uint8_t motorClosePin = 9;   // PWM for CLOSE direction
 const uint8_t ledStripPin   = 3;   // LED strip (PWM)
 const uint8_t rs485DirPin   = 2;   // MAX485 DE/RE tied together
@@ -58,17 +59,18 @@ void blinkSequence();
 void rs485Begin() {
   pinMode(rs485DirPin, OUTPUT);
   digitalWrite(rs485DirPin, LOW); // RX (DE/RE low)
-  RS485.begin(115200);
+  RS485.begin(9600);
   delay(50);
 }
 
 void rs485SendLine(const String& s) {
   digitalWrite(rs485DirPin, HIGH);  // TX enable
-  delayMicroseconds(8);
+  delayMicroseconds(50);
   RS485.print(s);
   RS485.print('\n');
   RS485.flush();
   digitalWrite(rs485DirPin, LOW);   // back to RX
+  delayMicroseconds(120);
 }
 
 // ACK helper (only for directed messages)
@@ -110,7 +112,10 @@ void processLine(String msg) {
   // Ignore new commands while busy (simple + robust)
   if (sys == BUSY) return;
 
-  if (cmd == "OPEN") {
+  if (cmd == "PING") {
+    ack("PONG", isBroadcast);
+  }
+  else if (cmd == "OPEN") {
     if (!isOpen) {
       ack("OPEN", isBroadcast);
       runMotorForward(openTimeMs);     // motor-only

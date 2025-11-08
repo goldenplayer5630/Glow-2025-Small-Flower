@@ -1,20 +1,20 @@
 #include <FastLED.h>
 
 /* -------- Debug flag -------- */
-#define DEBUG 1
+#define DEBUG 0
 #define DBG_BEGIN(baud)   do{ if (DEBUG){ Serial.begin(baud); while(!Serial){} } }while(0)
 #define DBG_PRINT(x)      do{ if (DEBUG){ Serial.print(x); } }while(0)
 #define DBG_PRINTLN(x)    do{ if (DEBUG){ Serial.println(x); } }while(0)
-/* single-arg print with precision */
 #define DBG_PRINT2(x,prec) do{ if (DEBUG){ Serial.print((x),(prec)); } }while(0)
+
+/* -------- Feature toggles -------- */
+// Set to 1 to enable ultrasonic stall safety; 0 disables it entirely.
+#define USE_US_SAFETY 0
 
 /* -------- Node identity -------- */
 const int myID = 1;                 // set unique ID
 
-/* -------- RS485 on UNO (Serial) --------
-   NOTE: UNO has only one HW UART. We share it:
-   - Debug prints occur while DE/RE = LOW (receiver only), so they won't hit the bus.
-   - ACKs toggle DE/RE HIGH for the duration of the send. */
+/* -------- RS485 on UNO (Serial) -------- */
 #define RS485 Serial
 const int rs485DirPin = 2;          // MAX485 DE/RE (tied together)
 
@@ -42,24 +42,30 @@ unsigned long usLastDebugMs = 0;
 
 /* -------- Motor timings -------- */
 int  defaultSpeed = 200;            // 0..255
-const unsigned long motorSafetyTimeoutMs = 10000;
+const unsigned long motorSafetyTimeoutMs = 15000;
+bool ignoreLimits = false;
 
 /* -------- FastLED WS2811: INNER + OUTER -------- */
 #define LED_PIN_INNER    3
 #define LED_PIN_OUTER    4
-#define NUM_LEDS_INNER   80   // <-- set to your inner ring count
-#define NUM_LEDS_OUTER   80   // <-- set to your outer ring count
+#define NUM_LEDS_INNER   112   // <-- set to your inner ring count
+#define NUM_LEDS_OUTER   119   // <-- set to your outer ring count
 #define LED_TYPE         WS2811
 #define COLOR_ORDER      BRG
 
 CRGB ledsInner[NUM_LEDS_INNER];
 CRGB ledsOuter[NUM_LEDS_OUTER];
 
-// Per-ring color + brightness (use global brightness=255; scale per ring)
-uint8_t iR=255, iG=255, iB=255, iBright=0;
-uint8_t oR=255, oG=255, oB=255, oBright=0;
+/* -------- Per-ring base color (set by RGB/RGBIN/RGBOUT) + intensity --------
+   Base color is 0..255. Intensity is 0..255 (mapped from UI 0..120).
+   The final shown color = BaseRGB * (Intensity/255), done via nscale8_video.
+*/
+uint8_t iBaseR=255, iBaseG=255, iBaseB=255;   // inner base color
+uint8_t oBaseR=255, oBaseG=255, oBaseB=255;   // outer base color
+uint8_t iBright=0;  // inner intensity 0..255
+uint8_t oBright=0;  // outer intensity 0..255
 
-// Non-blocking brightness ramps (per ring)
+// Non-blocking intensity ramps (per ring)
 bool           iRamp=false, oRamp=false;
 uint8_t        iStart=0,   oStart=0;
 uint8_t        iTarget=0,  oTarget=0;
@@ -70,6 +76,10 @@ unsigned long  iDurMs=0,   oDurMs=0;
 enum Motion { IDLE, EXTENDING, RETRACTING };
 Motion motion = IDLE;
 unsigned long motorStartMs = 0;
+
+// Track last commanded PWM values for STATUS
+int lastRPWM = 0;
+int lastLPWM = 0;
 
 // Ultrasonic state
 float         usLastDistCm = NAN;
@@ -88,17 +98,25 @@ bool anyRetractLimit(){
 void stopMotor(){
   analogWrite(RPWM, 0);
   analogWrite(LPWM, 0);
+  lastRPWM = 0;
+  lastLPWM = 0;
   if (motion != IDLE) DBG_PRINTLN(F("[DBG] Motor -> STOP"));
   motion = IDLE;
+
+  ignoreLimits = false;
+  // Clear ultrasonic progress tracking (safe even if disabled)
   usLastDistCm = NAN;
   usNoProgressCount = 0;
   usLastSampleMs = 0;
 }
 
 void extendMotor(int speed){
+  ignoreLimits = false;  
   if (anyExtendLimit()) { stopMotor(); DBG_PRINTLN(F("[DBG] Blocked: EXT limit active")); return; }
   analogWrite(LPWM, 0);
   analogWrite(RPWM, constrain(speed, 0, 255));
+  lastLPWM = 0;
+  lastRPWM = constrain(speed, 0, 255);
   motion = EXTENDING;
   motorStartMs = millis();
   usLastDistCm = NAN; usNoProgressCount = 0; usLastSampleMs = 0;
@@ -106,50 +124,87 @@ void extendMotor(int speed){
 }
 
 void retractMotor(int speed){
+  ignoreLimits = false;  
   if (anyRetractLimit()) { stopMotor(); DBG_PRINTLN(F("[DBG] Blocked: RET limit active")); return; }
   analogWrite(RPWM, 0);
   analogWrite(LPWM, constrain(speed, 0, 255));
+  lastRPWM = 0;
+  lastLPWM = constrain(speed, 0, 255);
   motion = RETRACTING;
   motorStartMs = millis();
   usLastDistCm = NAN; usNoProgressCount = 0; usLastSampleMs = 0;
   DBG_PRINT(F("[DBG] Motor -> RET speed=")); DBG_PRINTLN(speed);
 }
 
+void extendMotorOverride(int speed){
+  ignoreLimits = true; 
+  // Ignore extend-limit switches on purpose
+  analogWrite(LPWM, 0);
+  analogWrite(RPWM, constrain(speed, 0, 255));
+  lastLPWM = 0;
+  lastRPWM = constrain(speed, 0, 255);
+  motion = EXTENDING;
+  motorStartMs = millis();
+  usLastDistCm = NAN; usNoProgressCount = 0; usLastSampleMs = 0;
+  DBG_PRINT(F("[DBG] Motor -> EXT (override) speed=")); DBG_PRINTLN(speed);
+}
+
+void retractMotorOverride(int speed){
+  ignoreLimits = true; 
+  // Ignore retract-limit switches on purpose
+  analogWrite(RPWM, 0);
+  analogWrite(LPWM, constrain(speed, 0, 255));
+  lastRPWM = 0;
+  lastLPWM = constrain(speed, 0, 255);
+  motion = RETRACTING;
+  motorStartMs = millis();
+  usLastDistCm = NAN; usNoProgressCount = 0; usLastSampleMs = 0;
+  DBG_PRINT(F("[DBG] Motor -> RET (override) speed=")); DBG_PRINTLN(speed);
+}
+
+/* -------- Intensity scaling -------- */
+// Map 0..120 UI intensity to 0..255 internal (rounded)
+static inline uint8_t map120to255(int v) {
+  v = constrain(v, 0, 120);
+  return (uint8_t)((v * 255 + 60) / 120);
+}
+
 /* -------- FastLED helpers (per-ring) -------- */
 inline CRGB scaledColor(uint8_t r, uint8_t g, uint8_t b, uint8_t bright){
   CRGB c(r,g,b);
-  c.nscale8_video(bright);   // per-ring brightness
+  c.nscale8_video(bright);   // per-ring intensity
   return c;
 }
 inline void showRings(){
-  // Global brightness fixed to 255; we scale per ring
-  fill_solid(ledsInner, NUM_LEDS_INNER, scaledColor(iR,iG,iB,iBright));
-  fill_solid(ledsOuter, NUM_LEDS_OUTER, scaledColor(oR,oG,oB,oBright));
+  // Global brightness fixed to 255; we scale per ring with intensity
+  fill_solid(ledsInner, NUM_LEDS_INNER, scaledColor(iBaseR,iBaseG,iBaseB,iBright));
+  fill_solid(ledsOuter, NUM_LEDS_OUTER, scaledColor(oBaseR,oBaseG,oBaseB,oBright));
   FastLED.show();
 }
-inline void setRGBInner(uint8_t r,uint8_t g,uint8_t b){ iR=r; iG=g; iB=b; showRings(); }
-inline void setRGBOuter(uint8_t r,uint8_t g,uint8_t b){ oR=r; oG=g; oB=b; showRings(); }
+inline void setBaseRGBInner(uint8_t r,uint8_t g,uint8_t b){ iBaseR=r; iBaseG=g; iBaseB=b; showRings(); }
+inline void setBaseRGBOuter(uint8_t r,uint8_t g,uint8_t b){ oBaseR=r; oBaseG=g; oBaseB=b; showRings(); }
 inline void setBrightInner(uint8_t b){ iBright=b; showRings(); }
 inline void setBrightOuter(uint8_t b){ oBright=b; showRings(); }
 
+/* -------- Intensity ramps (0..255 target) -------- */
 inline void startRampInner(uint8_t target, unsigned long durMs){
   iStart = iBright; iTarget = target; iStartMs = millis(); iDurMs = durMs?durMs:1; iRamp = true;
-  DBG_PRINT(F("[DBG] RGBRAMP I -> ")); DBG_PRINT((int)target); DBG_PRINT(F(" over ")); DBG_PRINTLN(durMs);
+  DBG_PRINT(F("[DBG] LEDRAMP I -> ")); DBG_PRINT((int)target); DBG_PRINT(F(" over ")); DBG_PRINTLN(durMs);
 }
 inline void startRampOuter(uint8_t target, unsigned long durMs){
   oStart = oBright; oTarget = target; oStartMs = millis(); oDurMs = durMs?durMs:1; oRamp = true;
-  DBG_PRINT(F("[DBG] RGBRAMP O -> ")); DBG_PRINT((int)target); DBG_PRINT(F(" over ")); DBG_PRINTLN(durMs);
+  DBG_PRINT(F("[DBG] LEDRAMP O -> ")); DBG_PRINT((int)target); DBG_PRINT(F(" over ")); DBG_PRINTLN(durMs);
 }
 void updateRamps(){
   unsigned long now = millis();
   if (iRamp){
     unsigned long e = now - iStartMs;
-    if (e >= iDurMs){ iBright = iTarget; iRamp=false; showRings(); DBG_PRINTLN(F("[DBG] RGBRAMP I complete")); }
+    if (e >= iDurMs){ iBright = iTarget; iRamp=false; showRings(); DBG_PRINTLN(F("[DBG] LEDRAMP I complete")); }
     else { float t=(float)e/(float)iDurMs; int v=(int)iStart + (int)((int)iTarget-(int)iStart)*t; if(v<0)v=0; if(v>255)v=255; iBright=(uint8_t)v; showRings(); }
   }
   if (oRamp){
     unsigned long e = now - oStartMs;
-    if (e >= oDurMs){ oBright = oTarget; oRamp=false; showRings(); DBG_PRINTLN(F("[DBG] RGBRAMP O complete")); }
+    if (e >= oDurMs){ oBright = oTarget; oRamp=false; showRings(); DBG_PRINTLN(F("[DBG] LEDRAMP O complete")); }
     else { float t=(float)e/(float)oDurMs; int v=(int)oStart + (int)((int)oTarget-(int)oStart)*t; if(v<0)v=0; if(v>255)v=255; oBright=(uint8_t)v; showRings(); }
   }
 }
@@ -164,6 +219,7 @@ float readDistanceCm(){
   return echo / 58.0f;
 }
 void checkUltrasonicProgress(){
+  if (!USE_US_SAFETY) return;   // fully disabled when toggle is 0
   if (motion == IDLE) return;
 
   unsigned long now = millis();
@@ -181,10 +237,9 @@ void checkUltrasonicProgress(){
       DBG_PRINTLN(F("[US] d=--- (timeout)"));
     } else {
       DBG_PRINT(F("[US] d=")); DBG_PRINT(d); DBG_PRINT(F(" cm"));
-      // If we already have a previous sample, also show delta + trend expectation
       if (!isnan(usLastDistCm)) {
         float delta = d - usLastDistCm;
-        DBG_PRINT(F("  \xE2\x88\x86=")); DBG_PRINT2(delta, 2); // Δ with 2 decimals
+        DBG_PRINT(F("  \xE2\x88\x86=")); DBG_PRINT2(delta, 2);
         DBG_PRINT(F("  expect: "));
         DBG_PRINT((motion == EXTENDING) ? F("\xE2\x88\x86>=") : F("\xE2\x88\x86<="));
         DBG_PRINTLN(US_MIN_DELTA_CM);
@@ -194,10 +249,8 @@ void checkUltrasonicProgress(){
     }
   }
 
-  // If no valid reading, don't update stall logic
   if (d <= 0.0f) return;
 
-  // Stall detection vs expected trend
   if (isnan(usLastDistCm)){
     usLastDistCm = d;
     return;
@@ -236,22 +289,65 @@ void checkUltrasonicProgress(){
 void rs485Begin(){
   pinMode(rs485DirPin, OUTPUT);
   digitalWrite(rs485DirPin, LOW); // RX
-  RS485.begin(115200);
+  RS485.begin(9600);
   delay(30);
-  DBG_PRINTLN(F("[DBG] RS485 up @115200 (DE/RE LOW)"));
+  DBG_PRINTLN(F("[DBG] RS485 up @9600 (DE/RE LOW)"));
 }
 void rs485SendLine(const String &s){
   digitalWrite(rs485DirPin, HIGH); delayMicroseconds(8);
   RS485.print(s); RS485.print('\n'); RS485.flush();
   digitalWrite(rs485DirPin, LOW);
-  DBG_PRINT(F("[DBG] TX ACK: ")); DBG_PRINTLN(s);
+  DBG_PRINT(F("[DBG] TX: ")); DBG_PRINTLN(s);
 }
-// short ACK (only for direct, not broadcast)
-inline void ack(bool isBroadcast){ if(!isBroadcast) rs485SendLine(String(myID)+"/A"); }
+// ACK helpers (only for direct; broadcasts don't get replies)
+inline void ackOK(bool isBroadcast){ if (!isBroadcast) rs485SendLine(String(myID)+"/ACK"); }
+inline void ackPong(bool isBroadcast){ if (!isBroadcast) rs485SendLine(String(myID)+"/ACK:PONG"); }
+
+/* ------ STATUS reporting ------ */
+const char* motionName(Motion m){
+  switch(m){
+    case EXTENDING: return "EXT";
+    case RETRACTING: return "RET";
+    default: return "IDLE";
+  }
+}
+inline char bitChar(bool active){ return active ? '1' : '0'; }
+
+void sendStatus(bool isBroadcast){
+  if (isBroadcast) return; // respond only when directly addressed
+
+  // Read limit states (ACTIVE LOW => 1 means active)
+  char extA = bitChar(limitActiveLOW(R_LIMIT_A));
+  char extB = bitChar(limitActiveLOW(R_LIMIT_B));
+  char extC = bitChar(limitActiveLOW(R_LIMIT_C));
+  char retA = bitChar(limitActiveLOW(L_LIMIT_A));
+  char retB = bitChar(limitActiveLOW(L_LIMIT_B));
+  char retC = bitChar(limitActiveLOW(L_LIMIT_C));
+
+  String line;
+  line.reserve(200);
+  line += String(myID) + "/STATUS:";
+  line += "motion=";   line += motionName(motion);
+  line += ",speed=";   line += defaultSpeed;
+  line += ",rpwm=";    line += lastRPWM;
+  line += ",lpwm=";    line += lastLPWM;
+
+  line += ",extend=";  line += extA; line += ","; line += extB; line += ","; line += extC; // A,B,C
+  line += ",retract="; line += retA; line += ","; line += retB; line += ","; line += retC; // A,B,C
+
+  line += ",iRGB=";    line += (int)iBaseR; line += ","; line += (int)iBaseG; line += ","; line += (int)iBaseB;
+  line += ",iBright="; line += (int)iBright;
+  line += ",oRGB=";    line += (int)oBaseR; line += ","; line += (int)oBaseG; line += ","; line += (int)oBaseB;
+  line += ",oBright="; line += (int)oBright;
+  line += ",de_re=";   line += (digitalRead(rs485DirPin)==HIGH ? "HIGH" : "LOW");
+  line += ",uptime=";  line += millis();
+
+  rs485SendLine(line);
+}
 
 /* ================= Setup / Loop ================= */
 void setup(){
-  DBG_BEGIN(115200);
+  DBG_BEGIN(9600);
 
   // Motor
   pinMode(RPWM, OUTPUT); pinMode(LPWM, OUTPUT); stopMotor();
@@ -267,13 +363,15 @@ void setup(){
     pinMode(R_LIMIT_C, INPUT); pinMode(L_LIMIT_C, INPUT);
   }
 
-  // Ultrasonic
-  pinMode(US_TRIG, OUTPUT); pinMode(US_ECHO, INPUT); digitalWrite(US_TRIG, LOW);
+  // Ultrasonic (only if enabled)
+  if (USE_US_SAFETY){
+    pinMode(US_TRIG, OUTPUT); pinMode(US_ECHO, INPUT); digitalWrite(US_TRIG, LOW);
+  }
 
   // FastLED
   FastLED.addLeds<LED_TYPE, LED_PIN_INNER, COLOR_ORDER>(ledsInner, NUM_LEDS_INNER);
   FastLED.addLeds<LED_TYPE, LED_PIN_OUTER, COLOR_ORDER>(ledsOuter, NUM_LEDS_OUTER);
-  FastLED.setBrightness(255);   // global max; we scale per ring
+  FastLED.setBrightness(255);   // global max; we scale per ring with intensity
   showRings();
 
   // RS485
@@ -285,26 +383,36 @@ void setup(){
 void loop(){
   handleBus();
   handleMotorState();
-  checkUltrasonicProgress();
+  if (USE_US_SAFETY) checkUltrasonicProgress();
   updateRamps();
 }
 
 /* -------- Motor state safety -------- */
 void handleMotorState(){
   if (motion == IDLE) return;
-  if (millis() - motorStartMs >= motorSafetyTimeoutMs){ DBG_PRINTLN(F("[DBG] Safety timeout")); stopMotor(); return; }
-  if (motion == EXTENDING && anyExtendLimit()){ DBG_PRINTLN(F("[DBG] EXT limit triggered")); stopMotor(); return; }
-  if (motion == RETRACTING && anyRetractLimit()){ DBG_PRINTLN(F("[DBG] RET limit triggered")); stopMotor(); return; }
+
+  if (millis() - motorStartMs >= motorSafetyTimeoutMs){
+    DBG_PRINTLN(F("[DBG] Safety timeout"));
+    stopMotor();
+    return;
+  }
+
+  // Only enforce limits when not overriding
+  if (!ignoreLimits) {
+    if (motion == EXTENDING && anyExtendLimit()){
+      DBG_PRINTLN(F("[DBG] EXT limit triggered"));
+      stopMotor();
+      return;
+    }
+    if (motion == RETRACTING && anyRetractLimit()){
+      DBG_PRINTLN(F("[DBG] RET limit triggered"));
+      stopMotor();
+      return;
+    }
+  }
 }
 
-/* -------- Helpers to parse ring token -------- */
-char parseRing(const String& token){
-  String t = token; t.trim(); t.toUpperCase();
-  if (t == "I" || t == "INNER") return 'I';
-  if (t == "O" || t == "OUTER") return 'O';
-  if (t == "B" || t == "BOTH")  return 'B';
-  return '?';
-}
+/* -------- Parser helpers -------- */
 bool isNumberLike(const String& s){
   if (s.length()==0) return false;
   for (uint8_t i=0;i<s.length();++i){
@@ -312,16 +420,24 @@ bool isNumberLike(const String& s){
   }
   return true;
 }
+// Extract command and value supporting both "CMD:..." and "CMD,..." (or none)
+void splitCmdAndValue(const String& raw, String& cmd, String& value){
+  int colon = raw.indexOf(':');
+  if (colon >= 0){
+    cmd = raw.substring(0, colon);
+    value = raw.substring(colon + 1);
+    return;
+  }
+  int comma = raw.indexOf(',');
+  if (comma >= 0){
+    cmd = raw.substring(0, comma);
+    value = raw.substring(comma + 1);
+    return;
+  }
+  cmd = raw; value = "";
+}
 
-/* -------- Protocol: "<id>/<CMD>[:val]" --------
-   EXT[:spd] | OPEN[:spd]
-   RET[:spd] | CLOSE[:spd]
-   STOP
-   SPEED:n
-   RGB:[ring,]r,g,b        ring = I|INNER, O|OUTER, B|BOTH (default BOTH if omitted)
-   BRIGHT:[ring,]n
-   RGBRAMP:[ring,]n,ms
-*/
+/* -------- RS485 input -------- */
 void handleBus(){
   static String in;
   while (RS485.available()){
@@ -340,105 +456,126 @@ void processLine(String msg){
   bool isBroadcast = (id == 0);
   if (!isBroadcast && id != myID) return;
 
-  String rest = msg.substring(slash + 1);
-  int colon = rest.indexOf(':');
-  String command = (colon < 0) ? rest : rest.substring(0, colon);
-  String value   = (colon < 0) ? ""   : rest.substring(colon + 1);
+  String raw = msg.substring(slash + 1);
+  raw.trim();
+
+  String command, value;
+  splitCmdAndValue(raw, command, value);
   command.toUpperCase();
 
   DBG_PRINT(F("[DBG] RX ")); DBG_PRINT(id); DBG_PRINT('/'); DBG_PRINT(command);
   if (value.length()){ DBG_PRINT(':'); DBG_PRINT(value); } DBG_PRINTLN("");
 
-  if (command == "EXT" || command == "OPEN"){
-    int spd = value.length()? constrain(value.toInt(), 0, 255) : defaultSpeed;
-    defaultSpeed = spd; extendMotor(spd); ack(isBroadcast); return;
+  /* ====== Core controls ====== */
+
+  // PING -> PONG
+  if (command == "PING"){
+    ackPong(isBroadcast);
+    return;
   }
-  if (command == "RET" || command == "CLOSE"){
-    int spd = value.length()? constrain(value.toInt(), 0, 255) : defaultSpeed;
-    defaultSpeed = spd; retractMotor(spd); ack(isBroadcast); return;
+
+  // STATUS (full line)
+  if (command == "STATUS"){
+    sendStatus(isBroadcast);
+    return;
   }
-  if (command == "STOP"){ stopMotor(); ack(isBroadcast); return; }
-  if (command == "SPEED"){ defaultSpeed = constrain(value.toInt(), 0, 255); ack(isBroadcast); return; }
 
-  // ---------- RGB ----------
-  if (command == "RGB"){
-    int c1 = value.indexOf(',');
-    if (c1 < 0) return; // need at least two tokens
-    String first = value.substring(0,c1);
-    char ring = '?';
-    int startIdx = 0;
+  // OPEN/CLOSE always override (hardware protections trusted)
+  if (command == "OPEN" || command == "EXT"){
+    int spd = value.length()? constrain(value.toInt(), 0, 255) : defaultSpeed;
+    defaultSpeed = spd;
+    extendMotorOverride(spd);
+    ackOK(isBroadcast);
+    return;
+  }
+  if (command == "CLOSE" || command == "RET"){
+    int spd = value.length()? constrain(value.toInt(), 0, 255) : defaultSpeed;
+    defaultSpeed = spd;
+    retractMotorOverride(spd);
+    ackOK(isBroadcast);
+    return;
+  }
+  if (command == "STOP"){
+    stopMotor();
+    ackOK(isBroadcast);
+    return;
+  }
+  if (command == "SPEED"){
+    defaultSpeed = constrain(value.toInt(), 0, 255);
+    ackOK(isBroadcast);
+    return;
+  }
 
-    if (!isNumberLike(first)){
-      ring = parseRing(first);
-      startIdx = c1+1;
-    } else {
-      ring = 'B'; // default BOTH
-      startIdx = 0;
-    }
-
-    // Parse r,g,b starting from startIdx
-    String restVals = value.substring(startIdx);
-    int p1 = restVals.indexOf(',');
-    int p2 = (p1>=0) ? restVals.indexOf(',', p1+1) : -1;
+  /* ====== RGB base color (affects how intensities/ramps render) ====== */
+  // RGB:r,g,b           -> both rings base
+  // RGBIN:r,g,b         -> inner base
+  // RGBOUT:r,g,b        -> outer base
+  if (command == "RGB" || command == "RGBIN" || command == "RGBOUT"){
+    if (value.length()==0) return;
+    int p1 = value.indexOf(',');
+    int p2 = (p1>=0) ? value.indexOf(',', p1+1) : -1;
     if (p1<0 || p2<0) return;
 
-    int r = constrain(restVals.substring(0,p1).toInt(),0,255);
-    int g = constrain(restVals.substring(p1+1,p2).toInt(),0,255);
-    int b = constrain(restVals.substring(p2+1).toInt(),0,255);
+    uint8_t r = (uint8_t)constrain(value.substring(0,p1).toInt(), 0, 255);
+    uint8_t g = (uint8_t)constrain(value.substring(p1+1,p2).toInt(), 0, 255);
+    uint8_t b = (uint8_t)constrain(value.substring(p2+1).toInt(), 0, 255);
 
-    if (ring=='I'){ setRGBInner((uint8_t)r,(uint8_t)g,(uint8_t)b); }
-    else if (ring=='O'){ setRGBOuter((uint8_t)r,(uint8_t)g,(uint8_t)b); }
-    else { setRGBInner((uint8_t)r,(uint8_t)g,(uint8_t)b); setRGBOuter((uint8_t)r,(uint8_t)g,(uint8_t)b); }
-
-    ack(isBroadcast); return;
-  }
-
-  // ---------- BRIGHT ----------
-  if (command == "BRIGHT"){
-    if (value.length()==0) return;
-    int c1 = value.indexOf(',');
-    if (c1 < 0){
-      // BRIGHT:n  (both)
-      uint8_t n = (uint8_t)constrain(value.toInt(),0,255);
-      setBrightInner(n); setBrightOuter(n); ack(isBroadcast); return;
+    if (command == "RGB"){
+      setBaseRGBInner(r,g,b);
+      setBaseRGBOuter(r,g,b);
+    } else if (command == "RGBIN"){
+      setBaseRGBInner(r,g,b);
     } else {
-      // BRIGHT:ring,n
-      char ring = parseRing(value.substring(0,c1));
-      uint8_t n = (uint8_t)constrain(value.substring(c1+1).toInt(),0,255);
-      if (ring=='I') setBrightInner(n);
-      else if (ring=='O') setBrightOuter(n);
-      else { setBrightInner(n); setBrightOuter(n); }
-      ack(isBroadcast); return;
+      setBaseRGBOuter(r,g,b);
     }
+    ackOK(isBroadcast);
+    return;
   }
 
-  // ---------- RGBRAMP ----------
-  if (command == "RGBRAMP"){
+  /* ====== Intensity set (0..120 UI) ====== */
+  // LED:n           -> both rings
+  // LEDIN:n         -> inner only
+  // LEDOUT:n        -> outer only
+  // Aliases: LEDSET, LEDSETIN, LEDSETOUT
+  if (command == "LED" || command == "LEDIN" || command == "LEDOUT" ||
+      command == "LEDSET" || command == "LEDSETIN" || command == "LEDSETOUT"){
     if (value.length()==0) return;
-    int c1 = value.indexOf(',');
-    if (c1 < 0) return; // need at least one comma
+    uint8_t intensity = map120to255(value.toInt());
 
-    // Maybe RGBRAMP:n,ms   (both)
-    String first = value.substring(0,c1);
-    if (isNumberLike(first)){
-      uint8_t tgt = (uint8_t)constrain(first.toInt(),0,255);
-      unsigned long dur = (unsigned long)max(0, value.substring(c1+1).toInt());
-      startRampInner(tgt, dur); startRampOuter(tgt, dur); ack(isBroadcast); return;
+    if (command == "LED" || command == "LEDSET"){
+      setBrightInner(intensity);
+      setBrightOuter(intensity);
+    } else if (command == "LEDIN" || command == "LEDSETIN"){
+      setBrightInner(intensity);
+    } else { // LEDOUT or LEDSETOUT
+      setBrightOuter(intensity);
     }
-
-    // RGBRAMP:ring,n,ms
-    char ring = parseRing(first);
-    String restVals = value.substring(c1+1);
-    int c2 = restVals.indexOf(',');
-    if (c2 < 0) return;
-    uint8_t tgt = (uint8_t)constrain(restVals.substring(0,c2).toInt(),0,255);
-    unsigned long dur = (unsigned long)max(0, restVals.substring(c2+1).toInt());
-
-    if (ring=='I') startRampInner(tgt, dur);
-    else if (ring=='O') startRampOuter(tgt, dur);
-    else { startRampInner(tgt, dur); startRampOuter(tgt, dur); }
-    ack(isBroadcast); return;
+    ackOK(isBroadcast);
+    return;
   }
 
-  // unknown -> silent (no ACK, no prints)
+  /* ====== Intensity ramps (value 0..120, duration ms) ====== */
+  // LEDRAMP:v,ms       -> both
+  // LEDRAMPIN:v,ms     -> inner
+  // LEDRAMPOUT:v,ms    -> outer
+  if (command == "LEDRAMP" || command == "LEDRAMPIN" || command == "LEDRAMPOUT"){
+    if (value.length()==0) return;
+    int c = value.indexOf(',');
+    if (c < 0) return;
+    uint8_t tgt = map120to255(value.substring(0,c).toInt());
+    unsigned long dur = (unsigned long)max(0, value.substring(c+1).toInt());
+
+    if (command == "LEDRAMP"){
+      startRampInner(tgt, dur);
+      startRampOuter(tgt, dur);
+    } else if (command == "LEDRAMPIN"){
+      startRampInner(tgt, dur);
+    } else { // LEDRAMPOUT
+      startRampOuter(tgt, dur);
+    }
+    ackOK(isBroadcast);
+    return;
+  }
+
+  // Unknown command -> silent
 }
